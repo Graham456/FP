@@ -4,6 +4,9 @@ A working educational hybrid codec covering the proposal's milestones through
 November 13 and the integration work in progress on November 15. The actual
 compressed format is `.e424`; it is not H.264, HEVC, or an MP4 file.
 
+A second, separate codec, `bvc` (block-based video coder built from the lab
+code and `Codec.ipynb`), writes `.bvc` files; see [bvc](#bvc-block-based-hybrid-video-coder) below.
+
 ## Quick start (PowerShell)
 
 Install Python 3.10 or newer if needed, then open PowerShell in this folder:
@@ -133,3 +136,82 @@ See `docs/BITSTREAM.md` for the binary format.
 ## Instructor luminance benchmark
 
 [Raw Y commands and version-2 design](docs/LUMINANCE.md) · [First 100 Foreman frames, results](experiments/Final-Report.md#instructor-iteration-0-comparison)
+
+## bvc: block-based hybrid video coder
+
+`bvc/` is a self-contained package that does not use `en424`. It implements the
+hybrid coder from the 09_Video_coding slides and `bvc/Codec.ipynb`, built from the
+lab helper files in `bvc/basic colab setup/` (`motion.py`, `dct_utils.py`,
+`arith_utils.py`, `lab2_arith.py`, `DCT.py`). Input is raw 8-bit luma (`.y`),
+QCIF 176x144 by default; `input/foreman_qcif.y` (400 frames) is included.
+
+Per frame:
+
+    Current frame -(+)-> MCPR -> 8x8 DCT -> Q (uniform step) -> arithmetic coding -> .bvc
+    Q -> Q^-1 -> IDCT -(+ prediction)-> reconstructed frame (next frame's reference)
+    previous reconstructed + current -> motion estimation (full search SAD) -> MV -> motion compensation
+    MV -> arithmetic coding -> .bvc
+
+The first frame is predicted as flat 128 (effectively intra); every later frame is
+predicted from the previous *reconstructed* frame, so encoder and decoder never drift.
+
+### Commands (run from this folder)
+
+```powershell
+python -m bvc encode input/foreman_qcif.y output/foreman.bvc --step 16
+python -m bvc decode output/foreman.bvc output/foreman_dec.y --ref input/foreman_qcif.y
+python -m bvc benchmark input/foreman_qcif.y --frames 30
+```
+
+- `encode`: options `--step` (Q step, default 16), `--block-size` (16), `--search-range` (7),
+  `--frames` (default all), `--height/--width` (144/176), `--fps` (30). Writes the `.bvc`
+  file plus `<name>_enc_recon.y` (encoder reconstruction) and `<name>_frames.csv`
+  (bytes and PSNR per frame). Rate reported = 8 x the whole `.bvc` file size.
+- `decode`: uses only the `.bvc` file (size, step and block size are in its header) and
+  writes a raw `.y` clip. `--ref` prints PSNR against the original.
+- `benchmark`: codes the clip with the hybrid coder (`--steps`, default 48 32 20 12 8)
+  and with an intra-only DCT anchor (`DCT.py`'s `image_dct_enc`, `--qualities`,
+  default 10 25 50 75 90), prints BD-rate / BD-PSNR and saves `output/bd_rd_curve.png`.
+  Both codecs are charged for their headers and histograms.
+
+From a notebook: `from bvc.__main__ import main; main(['benchmark', 'input/foreman_qcif.y', '--show'])`.
+
+### .bvc file format
+
+    header   '<4sHHHHH'  magic b'BVC1', height, width, n_frames, step, block_size
+    per frame: MV chunk (mvx then mvy), then residual chunk (quantized coefficients)
+    chunk:   int32 offset (min value), uint32 n, uint32 counts[n] (histogram),
+             uint32 nbytes, nbytes of arithmetic-coded bits (packed MSB first)
+
+### Checking a decode
+
+The decoded clip must equal the encoder's reconstruction byte for byte:
+
+```powershell
+python -c "import numpy as np; print(np.array_equal(np.fromfile('output/foreman_enc_recon.y',np.uint8), np.fromfile('output/foreman_dec.y',np.uint8)))"
+```
+
+To view `.y` files in YUView, copy to a `.yuv` name with the size in it (for example
+`foreman_dec_176x144.yuv`) and set the format to 4:0:0 (luma only), 8-bit.
+
+### Results (foreman QCIF)
+
+| Run | Result |
+| --- | --- |
+| Full clip, step 16 | 1,271,693 bytes, 763 kbps @ 30 fps, 1.00 bpp, avg PSNR 35.58 dB; decode identical to encoder |
+| Benchmark, 30 frames | BD-rate -55.6 %, BD-PSNR +5.46 dB (hybrid vs intra DCT anchor) |
+
+### Module map
+
+| Module | Responsibility |
+| --- | --- |
+| `bvc/codec.py` | Hybrid encoder/decoder, `.bvc` format, intra DCT anchor, RD points |
+| `bvc/motion.py` | Full-search block motion estimation and motion compensation |
+| `bvc/transform.py` | 8x8 DCT/IDCT, MATLAB-style rounding, JPEG tables (from `dct_utils.py`) |
+| `bvc/entropy.py` | Static arithmetic encoder/decoder, `.bvc` chunk read/write |
+| `bvc/media.py` | Raw `.y` frame read/write |
+| `bvc/metrics.py` | PSNR, kbps, BD-rate / BD-PSNR |
+| `bvc/__main__.py` | Command line: `encode`, `decode`, `benchmark` |
+
+Not implemented yet: per-block intra/inter mode decision, periodic I-frames (GOP),
+deadzone quantization.
