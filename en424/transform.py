@@ -62,7 +62,7 @@ class Reader:
         return value // 2 if value % 2 == 0 else -(value // 2) - 1
 
 
-def write_block(out, coefficients):
+def write_block(out, coefficients, compact=False):
     """Count, then (preceding zero run, signed level); trailing zeros implicit."""
     values = [int(coefficients[y, x]) for y, x in ZIGZAG]
     put_uint(out, sum(v != 0 for v in values))
@@ -71,19 +71,31 @@ def write_block(out, coefficients):
         if value == 0:
             run += 1
         else:
-            put_uint(out, run)
-            put_signed(out, value)
+            if compact and run < 8 and abs(value) <= 7:
+                out.append(1 + 14 * run + 2 * (abs(value) - 1) + int(value < 0))
+            else:
+                if compact:
+                    out.append(0)
+                put_uint(out, run)
+                put_signed(out, value)
             run = 0
 
 
-def read_block(reader):
+def read_block(reader, compact=False):
     coefficients = np.zeros((8, 8), dtype=np.int32)
     count, pos = reader.uint(), -1
     if count > 64:
         raise ValueError("Invalid nonzero coefficient count")
     for _ in range(count):
-        pos += reader.uint() + 1
-        level = reader.signed()
+        token = reader.uint() if compact else 0
+        if token:
+            if token > 112:
+                raise ValueError('Invalid compact coefficient token')
+            run, signed = divmod(token - 1, 14)
+            level = (signed // 2 + 1) * (-1 if signed % 2 else 1)
+        else:
+            run, level = reader.uint(), reader.signed()
+        pos += run + 1
         if pos >= 64 or level == 0 or abs(level) > 65535:
             raise ValueError("Invalid run/level")
         coefficients[ZIGZAG[pos]] = level

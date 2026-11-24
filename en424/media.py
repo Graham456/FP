@@ -5,11 +5,22 @@ from PIL import Image
 from .codec import normalize_frames
 
 
-def load(path, limit=None, gray=False):
+def load(path, limit=None, gray=False, width=None, height=None):
     path = Path(path)
     fps = None
     if limit is not None and limit < 1:
         raise ValueError('Frame limit must be positive')
+    if path.suffix.lower() == '.y':
+        if width is None or height is None or min(width, height) < 1:
+            raise ValueError('Raw .y input requires positive --width and --height')
+        frame_size = width * height
+        count, remainder = divmod(path.stat().st_size, frame_size)
+        if count == 0 or remainder:
+            raise ValueError('Raw .y size must contain complete 8-bit luminance frames')
+        samples = min(limit or count, count) * frame_size
+        return np.fromfile(path, dtype=np.uint8, count=samples).reshape(-1, height, width), None
+    if width is not None or height is not None:
+        raise ValueError('Input dimensions apply only to headerless .y files')
     if path.suffix.lower() == '.npy':
         frames = np.load(path, allow_pickle=False)
         frames = normalize_frames(frames)
@@ -56,6 +67,12 @@ def load(path, limit=None, gray=False):
 
 def save(path, frames):
     path = Path(path)
+    if path.suffix.lower() == '.y':
+        if frames.ndim != 3 or frames.dtype != np.uint8:
+            raise ValueError('Raw .y output requires 8-bit grayscale frames')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frames.tofile(path)
+        return
     if path.suffix.lower() == '.npy':
         path.parent.mkdir(parents=True, exist_ok=True)
         np.save(path, frames, allow_pickle=False)

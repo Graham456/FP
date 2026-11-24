@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import time
 import numpy as np
-from .codec import Config, encode, decode
+from .codec import Config, encode, decode, quality_step
 from .media import load, save, demo_frames
 from .metrics import measure, bd_rate
 
@@ -21,20 +21,25 @@ def main():
     subs = parser.add_subparsers(dest='command', required=True)
     demo = subs.add_parser('demo', help='Generate a deterministic grayscale clip')
     demo.add_argument('output', nargs='?', default='output/demo.npy')
-    enc = subs.add_parser('encode', help='Encode NPY, PNG directory, or video')
-    dec = subs.add_parser('decode', help='Decode custom E424 to NPY or PNG directory')
+    enc = subs.add_parser('encode', help='Encode raw Y, NPY, PNG directory, or video')
+    dec = subs.add_parser('decode', help='Decode E424 to raw Y, NPY or PNG directory')
     evaluate = subs.add_parser('evaluate', help='Compare intra and hybrid across quantizers')
     for sub in (enc, evaluate):
         sub.add_argument('input')
         sub.add_argument('output')
         sub.add_argument('--fps', type=float, default=None)
         sub.add_argument('--frames', type=int, default=None)
+        sub.add_argument('--width', type=int, help='Raw .y input width in pixels')
+        sub.add_argument('--height', type=int, help='Raw .y input height in pixels')
+        sub.add_argument('--compact', action='store_true', help='Use compact run/level coding (E424 v2)')
         sub.add_argument('--gray', action='store_true')
         sub.add_argument('--block-size', type=int, default=16, choices=[8, 16, 32])
         sub.add_argument('--search-radius', type=int, default=4)
-        sub.add_argument('--gop', type=int, default=12)
+        sub.add_argument('--gop', type=int, help='I-frame interval; raw .y defaults to one initial I-frame')
         sub.add_argument('--no-skip', action='store_true')
-    enc.add_argument('--qstep', type=int, default=16)
+    quantizer = enc.add_mutually_exclusive_group()
+    quantizer.add_argument('--quality', type=int, help='Project quality from 1 to 100')
+    quantizer.add_argument('--qstep', type=int, default=16)
     enc.add_argument('--intra-only', action='store_true')
     evaluate.add_argument('--qsteps', type=int, nargs='+', default=[8, 16, 32, 64])
     dec.add_argument('input')
@@ -50,12 +55,15 @@ def main():
             save(args.output, frames)
             print(json.dumps(meta, indent=2))
             return
-        frames, source_fps = load(args.input, args.frames, args.gray)
+        frames, source_fps = load(args.input, args.frames, args.gray, args.width, args.height)
         fps = args.fps if args.fps is not None else (source_fps if source_fps else 30.0)
+        raw_luma = Path(args.input).suffix.lower() == ".y"
+        default_gop = 0 if raw_luma else 12
         options = dict(fps=fps, block_size=args.block_size, search_radius=args.search_radius,
-                       gop=args.gop, skip=not args.no_skip)
+                       gop=default_gop if args.gop is None else args.gop,
+                       compact=args.compact or raw_luma, skip=not args.no_skip)
         if args.command == 'encode':
-            data, reconstruction, stats = encode(frames, Config(qstep=args.qstep,
+            data, reconstruction, stats = encode(frames, Config(qstep=quality_step(args.quality) if args.quality is not None else args.qstep,
                                                                intra_only=args.intra_only, **options))
             write_bytes(args.output, data)
             result = measure(frames, reconstruction, len(data), fps)

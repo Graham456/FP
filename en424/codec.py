@@ -6,11 +6,19 @@ import zlib
 import numpy as np
 from . import entropy
 from .transform import quantize, reconstruct, write_block, read_block, Reader, put_signed
-from .motion import estimate, compensate
+from .motion import estimate, compensate, refine, half_prediction
 
 # Magic/version, width, height, channels, frames, fps, qstep, MB size, radius, GOP.
 HEADER = struct.Struct('<4sBIIBIdHHHH')
 PACKET = struct.Struct('<BIIII')  # frame type, raw bytes, coded bytes, raw CRC, coded CRC
+
+
+def quality_step(quality):
+    """Map project quality 1..100 to the uniform DCT step by linear interpolation."""
+    if not 1 <= quality <= 100:
+        raise ValueError("Quality must be between 1 and 100")
+    return int(np.rint(np.interp(quality, [1, 10, 30, 50, 70, 90, 100],
+                                 [100, 65, 42, 29, 21, 10, 1])))
 
 
 @dataclass(frozen=True)
@@ -22,6 +30,7 @@ class Config:
     fps: float = 30.0
     intra_only: bool = False
     skip: bool = True
+    compact: bool = False
 
     def validate(self):
         for name in ('qstep', 'block_size', 'search_radius', 'gop'):
@@ -31,7 +40,7 @@ class Config:
             raise ValueError('qstep must be 1..255')
         if self.block_size not in (8, 16, 32):
             raise ValueError('block_size must be 8, 16, or 32')
-        if not 0 <= self.search_radius <= 64 or not 1 <= self.gop <= 65535:
+        if not 0 <= self.search_radius <= 64 or not (0 if self.compact else 1) <= self.gop <= 65535:
             raise ValueError('Invalid search radius or GOP')
         if not math.isfinite(self.fps) or not 0 < self.fps <= 1000:
             raise ValueError('fps must be positive and at most 1000')
@@ -54,7 +63,7 @@ def luma(frame):
     return frame @ np.array([0.299, 0.587, 0.114])
 
 
-def encode_residual(residual, qstep):
+def encode_residual(residual, qstep, compact=False):
     size, _, channels = residual.shape
     out = bytearray()
     restored = np.empty_like(residual)
@@ -64,7 +73,7 @@ def encode_residual(residual, qstep):
             for x in range(0, size, 8):
                 coeff = quantize(residual[y:y + 8, x:x + 8, c], qstep)
                 all_zero = all_zero and not np.any(coeff)
-                write_block(out, coeff)
+                write_block(out, coeff, compact)
                 restored[y:y + 8, x:x + 8, c] = reconstruct(coeff, qstep)
     return out, restored, all_zero
 
@@ -85,14 +94,14 @@ def encode(frames, config=Config()):
     count, height, width, channels = frames.shape
     b = config.block_size
     ph, pw = (-height) % b, (-width) % b
-    stream = bytearray(HEADER.pack(b'E424', 1, width, height, channels, count,
+    stream = bytearray(HEADER.pack(b'E424', 2 if config.compact else 1, width, height, channels, count,
                                   config.fps, config.qstep, b, config.search_radius, config.gop))
     reference = None
     reconstructions, stats = [], []
     for index, frame in enumerate(frames):
         source = np.pad(frame, ((0, ph), (0, pw), (0, 0)), mode='edge')
         reconstructed = np.empty_like(source)
-        is_i = config.intra_only or index % config.gop == 0
+        is_i = config.intra_only or index == 0 or (config.gop > 0 and index % config.gop == 0)
         current_y = luma(source)
         reference_y = None if is_i else luma(reference)
         raw = bytearray()
@@ -100,14 +109,17 @@ def encode(frames, config=Config()):
         for y in range(0, source.shape[0], b):
             for x in range(0, source.shape[1], b):
                 block = source[y:y + b, x:x + b].astype(np.float64)
-                intra_data, intra_residual, _ = encode_residual(block - 128.0, config.qstep)
+                intra_data, intra_residual, _ = encode_residual(block - 128.0, config.qstep, config.compact)
                 candidate = bytearray([0]) + intra_data
                 result = intra_residual + 128.0
                 mode = 0
                 if not is_i:
                     dy, dx = estimate(current_y, reference_y, y, x, b, config.search_radius)
-                    prediction = compensate(reference, y, x, dy, dx, b)
-                    inter_data, inter_residual, zero = encode_residual(block - prediction, config.qstep)
+                    if config.compact:
+                        dy, dx = refine(current_y, reference_y, y, x, b, config.search_radius, (dy, dx))
+                    predictor = half_prediction if config.compact else compensate
+                    prediction = predictor(reference, y, x, dy, dx, b)
+                    inter_data, inter_residual, zero = encode_residual(block - prediction, config.qstep, config.compact)
                     inter = bytearray([1])
                     put_signed(inter, dy)
                     put_signed(inter, dx)
@@ -122,7 +134,7 @@ def encode(frames, config=Config()):
                 raw.extend(candidate)
                 modes[mode] += 1
                 reconstructed[y:y + b, x:x + b] = pixels(result)
-        coded = entropy.compress(raw)
+        coded = entropy.compress(raw, config.compact)
         stream.extend(PACKET.pack(0 if is_i else 1, len(raw), len(coded),
                                   zlib.crc32(raw), zlib.crc32(coded)))
         stream.extend(coded)
@@ -144,9 +156,9 @@ def decode(data, max_samples=100_000_000):
     if len(data) < HEADER.size:
         raise ValueError('Truncated header')
     magic, version, w, h, channels, count, fps, q, b, radius, gop = HEADER.unpack_from(data)
-    if magic != b'E424' or version != 1:
+    if magic != b'E424' or version not in (1, 2):
         raise ValueError('Unknown codec or version')
-    config = Config(q, b, radius, gop, fps)
+    config = Config(q, b, radius, gop, fps, compact=(version == 2))
     config.validate()
     if min(w, h, count) == 0 or channels not in (1, 3):
         raise ValueError('Invalid dimensions')
@@ -155,7 +167,7 @@ def decode(data, max_samples=100_000_000):
         raise ValueError('Decoded sample limit exceeded; use a shorter/smaller clip')
     blocks = hp * wp // (b * b)
     # Every transform block: count + 64 * (run + up to 3 bytes of level).
-    max_raw = blocks * (11 + channels * (b // 8) ** 2 * 257)
+    max_raw = blocks * (11 + channels * (b // 8) ** 2 * (321 if version == 2 else 257))
     offset = HEADER.size
     frames, reference = [], None
     for index in range(count):
@@ -171,7 +183,7 @@ def decode(data, max_samples=100_000_000):
         offset += coded_size
         if zlib.crc32(coded) != coded_crc:
             raise ValueError('Compressed payload checksum mismatch')
-        raw = entropy.decompress(coded, raw_size)
+        raw = entropy.decompress(coded, raw_size, config.compact)
         if zlib.crc32(raw) != raw_crc:
             raise ValueError('Decoded syntax checksum mismatch')
         reader = Reader(raw)
@@ -185,14 +197,16 @@ def decode(data, max_samples=100_000_000):
                     prediction = np.full((b, b, channels), 128.0)
                 else:
                     dy, dx = (reader.signed(), reader.signed()) if mode == 1 else (0, 0)
-                    if abs(dy) > radius or abs(dx) > radius:
+                    limit = radius * (2 if config.compact else 1)
+                    if abs(dy) > limit or abs(dx) > limit:
                         raise ValueError('Motion vector exceeds search range')
-                    prediction = compensate(reference, y, x, dy, dx, b)
+                    predictor = half_prediction if config.compact else compensate
+                    prediction = predictor(reference, y, x, dy, dx, b)
                 if mode != 2:
                     for c in range(channels):
                         for by in range(0, b, 8):
                             for bx in range(0, b, 8):
-                                coeff = read_block(reader)
+                                coeff = read_block(reader, version == 2)
                                 prediction[by:by + 8, bx:bx + 8, c] += reconstruct(coeff, q)
                 reconstructed[y:y + b, x:x + b] = pixels(prediction)
         if reader.pos != len(raw):

@@ -32,9 +32,9 @@ def update(counts, context, bit):
         counts[context] = [(v + 1) // 2 for v in counts[context]]
 
 
-def compress(data):
+def compress(data, prefix_model=False):
     low, high, pending = 0, TOP, 0
-    counts = [[1, 1] for _ in range(8)]
+    counts = [[1, 1] for _ in range(256 if prefix_model else 8)]
     out = BitsOut()
 
     def emit(bit, pending):
@@ -43,8 +43,9 @@ def compress(data):
             out.put(1 - bit)
 
     for byte in data:
-        for context in range(8):
-            bit = (byte >> (7 - context)) & 1
+        for position in range(8):
+            context = ((256 + byte) >> (8 - position)) if prefix_model else position
+            bit = (byte >> (7 - position)) & 1
             zero, one = counts[context]
             split = low + (high - low + 1) * zero // (zero + one)
             if bit:
@@ -73,7 +74,7 @@ def compress(data):
     return out.finish()
 
 
-def decompress(data, size):
+def decompress(data, size, prefix_model=False):
     if not data or size < 0:
         raise ValueError("Invalid arithmetic payload")
     pos = 0
@@ -87,11 +88,12 @@ def decompress(data, size):
     low, high, code = 0, TOP, 0
     for _ in range(32):
         code = code * 2 + get()
-    counts = [[1, 1] for _ in range(8)]
+    counts = [[1, 1] for _ in range(256 if prefix_model else 8)]
     out = bytearray()
     for _ in range(size):
         byte = 0
-        for context in range(8):
+        for position in range(8):
+            context = (1 << position) + byte if prefix_model else position
             zero, one = counts[context]
             split = low + (high - low + 1) * zero // (zero + one)
             bit = int(code >= split)

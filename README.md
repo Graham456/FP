@@ -125,3 +125,11 @@ which favors inter coding. No general compression claim follows from this clip.
 
 See `docs/STATUS_2026-11-15.md` for milestone mapping and outstanding evaluation.
 See `docs/BITSTREAM.md` for the binary format.
+
+## Final evaluation
+
+[Final report](experiments/Final-Report.md) and [architecture and block diagrams](experiments/Architecture.md). The report links the measured results, rate-distortion plots, scene-cut analysis and reproduction commands.
+
+## Instructor luminance benchmark
+
+[Raw Y commands and version-2 design](docs/LUMINANCE.md) · [First 100 Foreman frames, results](experiments/Final-Report.md#instructor-iteration-0-comparison)
